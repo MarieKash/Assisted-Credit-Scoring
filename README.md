@@ -11,6 +11,12 @@ The anonymous copy intentionally omits cached result folders, old evaluation
 artifacts, GitHub Pages files, and HTML exports. Those files are generated
 locally when you run the commands below.
 
+## Case-Study Network Figure
+
+![Case 1 citation network](citation_network_case1_preview.png)
+
+Full vector/PDF version: [citation_network_case1.pdf](citation_network_case1.pdf)
+
 ## Core Scores
 
 For a paper `p`:
