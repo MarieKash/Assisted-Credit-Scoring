@@ -1,0 +1,830 @@
+"""
+Formal Framework for Knowledge Discovery via Importance-Weighted Citation Graphs
+
+Implements all definitions from the framework paper, consuming the JSON outputs
+produced by importance_scoring.py:
+  - *_section_scores.json   → hierarchical section importance tree
+  - *_paragraph_scores.json → per-paragraph technical/citation scores
+  - *_paragraph_citation_scores.json → per-paragraph per-citation allocations
+  - *_citation_scores.json  → per-citation aggregated importance scores
+
+Quick start
+-----------
+    from citation_graph_framework import KnowledgeDiscoveryFramework
+
+    fw = KnowledgeDiscoveryFramework.from_results_dir(
+        "paper_results/",
+        citation_mappings={"(Wu et al.,2023)": "some_paper_dir"},
+        pub_dates={"adv_res_paper": 2024},
+    )
+
+    print(fw.graph)
+    print(fw.pagerank.top_k(5))
+    print(fw.originality.rank_by_originality())
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Section-type classification
+# ---------------------------------------------------------------------------
+
+_TECHNICAL_KEYWORDS = frozenset({
+    "method", "methods", "approach", "algorithm", "implementation",
+    "experiment", "experiments", "evaluation", "result", "results",
+    "proof", "derivation", "formulation", "model", "architecture",
+    "training", "dataset", "analysis", "ablation", "technical",
+    "proposed", "framework", "system", "design",
+})
+
+_RHETORICAL_KEYWORDS = frozenset({
+    "introduction", "intro", "related", "background", "conclusion",
+    "discussion", "future", "abstract", "overview", "motivation",
+    "acknowledgement", "acknowledgment", "limitations", "limitation",
+})
+
+
+def classify_section(name: str) -> str:
+    """Return 'technical', 'rhetorical', or 'neutral' for a section name."""
+    lower = name.lower()
+    for kw in _TECHNICAL_KEYWORDS:
+        if kw in lower:
+            return "technical"
+    for kw in _RHETORICAL_KEYWORDS:
+        if kw in lower:
+            return "rhetorical"
+    return "neutral"
+
+
+# ---------------------------------------------------------------------------
+# Citation helpers (same patterns as importance_scoring.py)
+# ---------------------------------------------------------------------------
+
+_CITATION_RE = re.compile(
+    r"\([A-Z][^)]*\d{4}[a-z]?\)"
+    r"|\[(?:\s*\d+\s*(?:[-,;–]\s*\d+\s*)*)\]"
+)
+
+
+def _split_citation_block(block: str) -> List[str]:
+    """Split a compound block into individual citation strings.
+
+    Mirrors split_citation_block in importance_scoring.py so that
+    '(Wu et al., 2023; Hong et al., 2023)' → ['(Wu et al., 2023)', '(Hong et al., 2023)'].
+    """
+    b = block.strip()
+    if b.startswith("(") and b.endswith(")"):
+        ld, rd, inner = "(", ")", b[1:-1]
+    elif b.startswith("[") and b.endswith("]"):
+        ld, rd, inner = "[", "]", b[1:-1]
+    else:
+        return [b]
+
+    if ";" in inner:
+        parts = inner.split(";")
+    elif ld == "[" and "," in inner:
+        parts = inner.split(",")
+    else:
+        parts = [inner]
+
+    cleaned = [re.sub(r"\s+", " ", p).strip() for p in parts if p.strip()]
+    return [f"{ld}{p}{rd}" for p in cleaned] if cleaned else [b]
+
+
+def _norm_cit(cit: str) -> str:
+    """Strip all whitespace for robust citation-key matching."""
+    return re.sub(r"\s+", "", cit)
+
+
+def _result_file_for_model(results_dir: Path, paper_id: str, stem: str, model_tag: str = "") -> Path:
+    if model_tag:
+        tagged = results_dir / f"{paper_id}_{model_tag}_{stem}.json"
+        if tagged.exists():
+            return tagged
+    return results_dir / f"{paper_id}_{stem}.json"
+
+
+# ---------------------------------------------------------------------------
+# Data containers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ParagraphScore:
+    """Single paragraph with its importance decomposition (Definition 1)."""
+
+    section_path: List[str]
+    paragraph_index: int
+    paragraph: str
+    technical_score: float   # S_tech(p_i)
+    citation_score: float    # S_cite(p_i)
+
+    def top_level_section(self) -> Optional[str]:
+        return self.section_path[0] if self.section_path else None
+
+    def citations_in_paragraph(self) -> List[str]:
+        """Return individual citation strings found in the paragraph text.
+
+        Compound blocks like '(A, 2023; B, 2024)' are split so each citation
+        appears as its own entry; the caller's proportional formula then
+        assigns each an equal share of the paragraph's citation_score.
+        """
+        result: List[str] = []
+        for block in _CITATION_RE.findall(self.paragraph):
+            result.extend(_split_citation_block(block))
+        return result
+
+    def unique_citations(self) -> Set[str]:
+        return set(self.citations_in_paragraph())
+
+
+@dataclass
+class ParagraphCitationScore:
+    """Single citation allocation within a paragraph."""
+
+    section_path: List[str]
+    paragraph_index: int
+    paragraph: str
+    citation: str
+    citation_score: float
+
+    def top_level_section(self) -> Optional[str]:
+        return self.section_path[0] if self.section_path else None
+
+
+@dataclass
+class InternalCitationDiagnostic:
+    source_paper: str
+    citation_key: str
+    target_paper: str
+    explicit_score: Optional[float]
+    fallback_score: float
+    final_score: float
+    status: str
+
+
+@dataclass
+class SectionScore:
+    """Node in the hierarchical importance tree T_p = (V_p, E_p)."""
+
+    name: str
+    total_score: float
+    citation_score: float
+    subsections: Dict[str, "SectionScore"] = field(default_factory=dict)
+
+    @property
+    def technical_score(self) -> float:
+        return self.total_score - self.citation_score
+
+    @property
+    def section_type(self) -> str:
+        if self.citation_score > 0:
+            return "technical" if self.technical_score / self.citation_score > 1 else "rhetorical"
+        if self.technical_score > 0:
+            return "technical"
+        return "neutral"
+
+    def all_flat(self) -> List["SectionScore"]:
+        """Return this node and all descendants."""
+        result: List[SectionScore] = [self]
+        for sub in self.subsections.values():
+            result.extend(sub.all_flat())
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Paper
+# ---------------------------------------------------------------------------
+
+class Paper:
+    """
+    A paper p ∈ P with its full hierarchical importance score tree T_p.
+
+    Loads data from the three JSON files produced by importance_scoring.py.
+    """
+
+    def __init__(
+        self,
+        paper_id: str,
+        results_dir: Path,
+        pub_date: Optional[int] = None,
+        model_tag: str = "",
+    ) -> None:
+        self.paper_id = paper_id
+        self.results_dir = Path(results_dir)
+        self.pub_date = pub_date          # publication year for temporal analysis
+        self.model_tag = model_tag.strip()
+        self._section_scores: Optional[Dict[str, SectionScore]] = None
+        self._paragraph_scores: Optional[List[ParagraphScore]] = None
+        self._paragraph_citation_scores: Optional[List[ParagraphCitationScore]] = None
+        self._has_paragraph_citation_scores_file = False
+        self._citation_scores: Optional[Dict[str, float]] = None
+
+    # --- loading ---
+
+    def load(self) -> "Paper":
+        """Load all score data from the results directory."""
+        name = self.results_dir.name
+        self._load_sections(_result_file_for_model(self.results_dir, name, "section_scores", self.model_tag))
+        self._load_paragraphs(_result_file_for_model(self.results_dir, name, "paragraph_scores", self.model_tag))
+        self._load_paragraph_citations(
+            _result_file_for_model(self.results_dir, name, "paragraph_citation_scores", self.model_tag)
+        )
+        self._load_citations(_result_file_for_model(self.results_dir, name, "citation_scores", self.model_tag))
+        return self
+
+    def _load_sections(self, path: Path) -> None:
+        self._section_scores = {}
+        if path.exists():
+            with open(path) as f:
+                self._section_scores = _parse_section_tree(json.load(f))
+
+    def _load_paragraphs(self, path: Path) -> None:
+        self._paragraph_scores = []
+        if path.exists():
+            with open(path) as f:
+                raw = json.load(f)
+            self._paragraph_scores = [
+                ParagraphScore(
+                    section_path=p["section_path"],
+                    paragraph_index=p["paragraph_index"],
+                    paragraph=p["paragraph"],
+                    technical_score=p["technical_score"],
+                    citation_score=p["citation_score"],
+                )
+                for p in raw
+            ]
+
+    def _load_paragraph_citations(self, path: Path) -> None:
+        self._paragraph_citation_scores = []
+        self._has_paragraph_citation_scores_file = path.exists()
+        if path.exists():
+            with open(path) as f:
+                raw = json.load(f)
+            self._paragraph_citation_scores = [
+                ParagraphCitationScore(
+                    section_path=p["section_path"],
+                    paragraph_index=p["paragraph_index"],
+                    paragraph=p.get("paragraph", ""),
+                    citation=p["citation"],
+                    citation_score=p["citation_score"],
+                )
+                for p in raw
+            ]
+
+    def _load_citations(self, path: Path) -> None:
+        self._citation_scores = {}
+        if path.exists():
+            with open(path) as f:
+                raw = json.load(f)
+            self._citation_scores = {k: v["citation_score"] for k, v in raw.items()}
+
+    # --- properties ---
+
+    @property
+    def section_scores(self) -> Dict[str, SectionScore]:
+        if self._section_scores is None:
+            raise ValueError(f"{self.paper_id}: call load() first")
+        return self._section_scores
+
+    @property
+    def paragraph_scores(self) -> List[ParagraphScore]:
+        if self._paragraph_scores is None:
+            raise ValueError(f"{self.paper_id}: call load() first")
+        return self._paragraph_scores
+
+    @property
+    def paragraph_citation_scores(self) -> List[ParagraphCitationScore]:
+        if self._paragraph_citation_scores is None:
+            raise ValueError(f"{self.paper_id}: call load() first")
+        return self._paragraph_citation_scores
+
+    @property
+    def has_paragraph_citation_scores(self) -> bool:
+        return self._has_paragraph_citation_scores_file
+
+    @property
+    def citation_scores(self) -> Dict[str, float]:
+        if self._citation_scores is None:
+            raise ValueError(f"{self.paper_id}: call load() first")
+        return self._citation_scores
+
+    def citation_score_exact(self, citation_key: str) -> Optional[float]:
+        """Return the saved paper-level score for a citation key, if present."""
+        if citation_key in self.citation_scores:
+            return self.citation_scores[citation_key]
+        norm_key = _norm_cit(citation_key)
+        for key, score in self.citation_scores.items():
+            if _norm_cit(key) == norm_key:
+                return score
+        return None
+
+    # --- derived quantities ---
+
+    def originality_score(self) -> float:
+        """Orig(p) = Σ S_tech(p_i)  (Definition 4.3)"""
+        return sum(para.technical_score for para in self.paragraph_scores)
+
+    def total_citation_importance(self) -> float:
+        """Σ S_cite(p_i) over all paragraphs."""
+        return sum(para.citation_score for para in self.paragraph_scores)
+
+    def section_citation_weight(self, citation_key: str, section_name: str) -> float:
+        """
+        W_s(p, q): importance-weight of citation q in section s.  (Definition 4.1)
+
+        Uses the exact per-paragraph per-citation allocations emitted by
+        importance_score.py when available. For backward compatibility with
+        older results directories, falls back to distributing each paragraph's
+        citation_score proportionally across citations present in that paragraph.
+        """
+        norm_key = _norm_cit(citation_key)
+        if self.has_paragraph_citation_scores:
+            exact_total = sum(
+                alloc.citation_score
+                for alloc in self.paragraph_citation_scores
+                if alloc.top_level_section() == section_name
+                and _norm_cit(alloc.citation) == norm_key
+            )
+            if exact_total > 0.0:
+                return exact_total
+
+        total = 0.0
+        for para in self.paragraph_scores:
+            if para.top_level_section() != section_name:
+                continue
+            cites = para.citations_in_paragraph()
+            if not cites:
+                continue
+            norm_cites = [_norm_cit(c) for c in cites]
+            count = norm_cites.count(norm_key)
+            if count == 0:
+                continue
+            total += para.citation_score * count / len(cites)
+        return total
+
+    def _per_paragraph_cite_score(self, citation_key: str):
+        """Yield (citation_score_i, paragraph) pairs for every paragraph that cites q."""
+        norm_key = _norm_cit(citation_key)
+        if self.has_paragraph_citation_scores:
+            para_index: Dict[tuple, "ParagraphScore"] = {
+                (p.paragraph_index, tuple(p.section_path)): p
+                for p in self.paragraph_scores
+            }
+            exact_pairs: List[Tuple[float, ParagraphScore]] = []
+            for alloc in self.paragraph_citation_scores:
+                if _norm_cit(alloc.citation) != norm_key:
+                    continue
+                para = para_index.get((alloc.paragraph_index, tuple(alloc.section_path)))
+                if para is not None:
+                    exact_pairs.append((alloc.citation_score, para))
+            if exact_pairs:
+                for pair in exact_pairs:
+                    yield pair
+                return
+
+        for para in self.paragraph_scores:
+            cites = para.citations_in_paragraph()
+            if not cites:
+                continue
+            norm_cites = [_norm_cit(c) for c in cites]
+            count = norm_cites.count(norm_key)
+            if count == 0:
+                continue
+            yield para.citation_score * count / len(cites), para
+
+    def citation_score_from_paragraphs(self, citation_key: str) -> float:
+        """
+        Estimate a citation's paper-level score from paragraph evidence.
+
+        Uses exact per-paragraph citation allocations when they exist; otherwise
+        falls back to distributing each paragraph's citation channel score
+        proportionally across citations mentioned in that paragraph.
+        """
+        return sum(cite_score for cite_score, _ in self._per_paragraph_cite_score(citation_key))
+
+    def w_tech(self, citation_key: str) -> float:
+        """W_tech(p, q) = Σ_i cite_score_i(q) × technical_score_i."""
+        return sum(
+            cite_score * para.technical_score
+            for cite_score, para in self._per_paragraph_cite_score(citation_key)
+        )
+
+    def w_rhet(self, citation_key: str) -> float:
+        """W_rhet(p, q) = Σ_i cite_score_i(q) × citation_score_i (paragraph's citation score)."""
+        return sum(
+            cite_score * para.citation_score
+            for cite_score, para in self._per_paragraph_cite_score(citation_key)
+        )
+
+    def citation_role_vector(self, citation_key: str) -> Dict[str, float]:
+        """r⃗(p, q): maps each top-level section to W_s(p, q).  (Definition 4.2)"""
+        return {
+            s: self.section_citation_weight(citation_key, s)
+            for s in self.section_scores
+        }
+
+    def __repr__(self) -> str:
+        return f"Paper(id={self.paper_id!r}, pub_date={self.pub_date})"
+
+
+def _parse_section_tree(raw: dict) -> Dict[str, SectionScore]:
+    result: Dict[str, SectionScore] = {}
+    for name, data in raw.items():
+        result[name] = SectionScore(
+            name=name,
+            total_score=data["total_score"],
+            citation_score=data["citation_score"],
+            subsections=_parse_section_tree(data.get("subsections", {})),
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Citation Graph  (Definition 2.1)
+# ---------------------------------------------------------------------------
+
+class CitationGraph:
+    """
+    Importance-Weighted Citation Graph  G = (P, E, W).
+
+    Nodes  : paper IDs (corpus papers) and citation strings (external refs)
+    Edges  : (p, q) iff paper p cites q
+    Weights: W(p, q) = Σ_{p_i ∈ P(p)} S_i(q) · 1[q ∈ C(p_i)]
+             = paper p's total citation_score allocated to q
+             (read directly from *_citation_scores.json)
+    """
+
+    def __init__(self) -> None:
+        self.papers: Dict[str, Paper] = {}
+        # Per-paper mapping: {paper_id: {citation_str: canonical_id}}
+        # Kept scoped so that [2] in paper A and [2] in paper B resolve independently.
+        self._citation_map: Dict[str, Dict[str, str]] = {}
+        self._weights: Dict[Tuple[str, str], float] = defaultdict(float)
+        self._out_weights: Dict[str, float] = defaultdict(float)
+        self._in_weights: Dict[str, float] = defaultdict(float)
+        self._internal_citation_diagnostics: List[InternalCitationDiagnostic] = []
+
+    # --- construction ---
+
+    def add_paper(self, paper: Paper) -> "CitationGraph":
+        self.papers[paper.paper_id] = paper
+        return self
+
+    def add_citation_mappings(self, mappings: Dict[str, Dict[str, str]]) -> "CitationGraph":
+        """
+        mappings: {paper_id: {citation_str: canonical_id}}
+        Produced by CitationResolver.build_citation_mappings().
+        """
+        for paper_id, paper_map in mappings.items():
+            self._citation_map.setdefault(paper_id, {}).update(paper_map)
+        return self
+
+    @classmethod
+    def from_results_dir(
+        cls,
+        results_dir: str | Path,
+        citation_mappings: Optional[Dict[str, Dict[str, str]]] = None,
+        pub_dates: Optional[Dict[str, int]] = None,
+        model_tag: str = "",
+        exclude_papers: Optional[Set[str]] = None,
+    ) -> "CitationGraph":
+        """
+        Load every paper subdirectory under results_dir and build the graph.
+
+        Args:
+            results_dir    : directory containing one sub-folder per paper.
+            citation_mappings: maps raw citation strings → paper_ids (for
+                               cross-paper edges between corpus papers).
+            pub_dates      : maps paper_id → publication year.
+        """
+        path = Path(results_dir)
+        graph = cls()
+        excluded = {paper.strip() for paper in (exclude_papers or set()) if paper.strip()}
+        for paper_dir in sorted(path.iterdir()):
+            if not paper_dir.is_dir() or paper_dir.name.startswith("."):
+                continue
+            paper_id = paper_dir.name
+            if paper_id in excluded:
+                continue
+            paper = Paper(
+                paper_id,
+                paper_dir,
+                pub_date=(pub_dates or {}).get(paper_id),
+                model_tag=model_tag,
+            )
+            try:
+                paper.load()
+                graph.add_paper(paper)
+            except Exception as exc:
+                print(f"[CitationGraph] Warning: could not load {paper_id}: {exc}")
+        if citation_mappings:
+            graph.add_citation_mappings(citation_mappings)
+        graph.build()
+        return graph
+
+    def build(self) -> "CitationGraph":
+        """Compute all edge weights from loaded paper citation scores."""
+        self._weights.clear()
+        self._out_weights.clear()
+        self._in_weights.clear()
+        self._internal_citation_diagnostics = []
+        corpus_ids = set(self.papers)
+
+        def explicit_score_for(paper: Paper, citation_key: str) -> Optional[float]:
+            if hasattr(paper, "citation_score_exact"):
+                return paper.citation_score_exact(citation_key)
+            return getattr(paper, "citation_scores", {}).get(citation_key)
+
+        def paragraph_fallback_for(paper: Paper, citation_key: str) -> float:
+            if hasattr(paper, "citation_score_from_paragraphs"):
+                return paper.citation_score_from_paragraphs(citation_key)
+            return 0.0
+
+        for paper_id, paper in self.papers.items():
+            paper_map = self._citation_map.get(paper_id, {})
+            target_to_keys: Dict[str, List[str]] = defaultdict(list)
+            for cit_str, target in paper_map.items():
+                if target is None or target == paper_id:
+                    continue
+                target_to_keys[target].append(cit_str)
+
+            for target, citation_keys in target_to_keys.items():
+                is_internal = target in corpus_ids
+                explicit_positive_exists = any(
+                    (explicit_score_for(paper, cit_str) or 0.0) > 0.0
+                    for cit_str in citation_keys
+                )
+                for cit_str in citation_keys:
+                    explicit_score = explicit_score_for(paper, cit_str)
+                    fallback_score = 0.0
+                    final_score = 0.0
+                    status = "missing"
+
+                    if explicit_score is not None and explicit_score > 0.0:
+                        final_score = explicit_score
+                        status = "paper_score"
+                    elif is_internal and not explicit_positive_exists:
+                        fallback_score = paragraph_fallback_for(paper, cit_str)
+                        if fallback_score > 0.0:
+                            final_score = fallback_score
+                            status = "paragraph_fallback"
+                    elif is_internal and explicit_positive_exists:
+                        status = "ignored_duplicate_missing"
+
+                    if is_internal:
+                        self._internal_citation_diagnostics.append(
+                            InternalCitationDiagnostic(
+                                source_paper=paper_id,
+                                citation_key=cit_str,
+                                target_paper=target,
+                                explicit_score=explicit_score,
+                                fallback_score=fallback_score,
+                                final_score=final_score,
+                                status=status,
+                            )
+                        )
+
+                    if final_score <= 0.0:
+                        continue
+                    self._weights[(paper_id, target)] += final_score
+                    self._out_weights[paper_id] += final_score
+                    self._in_weights[target] += final_score
+        return self
+
+    # --- accessors ---
+
+    def weight(self, src: str, tgt: str) -> float:
+        """W(p, q)."""
+        return self._weights.get((src, tgt), 0.0)
+
+    def out_weight(self, paper_id: str) -> float:
+        """W_out(p) = Σ_q W(p, q)."""
+        return self._out_weights.get(paper_id, 0.0)
+
+    def in_weight(self, node_id: str) -> float:
+        """W_in(q) = Σ_p W(p, q)."""
+        return self._in_weights.get(node_id, 0.0)
+
+    def total_weight(self) -> float:
+        """m = Σ_{(p,q) ∈ E} W(p, q)."""
+        return sum(self._weights.values())
+
+    def edges(self) -> Dict[Tuple[str, str], float]:
+        return dict(self._weights)
+
+    def successors(self, paper_id: str) -> Dict[str, float]:
+        """Papers cited by paper_id → weight."""
+        return {t: w for (s, t), w in self._weights.items() if s == paper_id}
+
+    def predecessors(self, node_id: str) -> Dict[str, float]:
+        """Papers that cite node_id → weight."""
+        return {s: w for (s, t), w in self._weights.items() if t == node_id}
+
+    def all_nodes(self) -> Set[str]:
+        nodes: Set[str] = set(self.papers)
+        for s, t in self._weights:
+            nodes.add(s)
+            nodes.add(t)
+        return nodes
+
+    def corpus_nodes(self) -> Set[str]:
+        return set(self.papers)
+
+    def internal_citation_audit(self) -> List[InternalCitationDiagnostic]:
+        return list(self._internal_citation_diagnostics)
+
+    def _citation_strings_for(self, paper: Paper, cited_key: str) -> Set[str]:
+        """
+        Find citation strings in *paper* that resolve to cited_key.
+        Works whether cited_key is a raw citation string or a paper_id.
+        """
+        return {
+            cit for cit in paper.citation_scores
+            if self._citation_map.get(cit, cit) == cited_key
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"CitationGraph(corpus={len(self.papers)}, "
+            f"nodes={len(self.all_nodes())}, edges={len(self._weights)})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Normalized Reference Score  (Definition 3.1)
+# ---------------------------------------------------------------------------
+
+class PageRankAnalyzer:
+    """
+    Normalized Reference Score.
+
+    IPR(q) = Σ_{p:(p,q)∈E} W(p,q)
+
+    Total importance weight flowing into q across all citing papers.
+    Papers with no incoming edges naturally score 0.
+    """
+
+    def __init__(self, graph: CitationGraph) -> None:
+        self.graph = graph
+
+    def compute(self) -> Dict[str, float]:
+        """Return {node_id: IPR_score} as total incoming citation weight."""
+        scores: Dict[str, float] = {}
+        for (_, tgt), w in self.graph.edges().items():
+            scores[tgt] = scores.get(tgt, 0.0) + w
+        return scores
+
+    def top_k(self, k: int = 10) -> List[Tuple[str, float]]:
+        scores = self.compute()
+        return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k]
+
+
+# ---------------------------------------------------------------------------
+# Influence Propagation  (Definition 3.2)
+# ---------------------------------------------------------------------------
+
+class InfluenceAnalyzer:
+    """
+    Multi-hop influence propagation.
+
+    Inf_1(q→p)   = W(p, q)
+    Inf_k(q→p)   = Σ_r W(p,r) · Inf_{k-1}(q→r)
+    Inf(q→p)     = Σ_{k=1}^K λ^{k-1} · Inf_k(q→p)
+    """
+
+    def __init__(self, graph: CitationGraph) -> None:
+        self.graph = graph
+
+    def influence_from(
+        self,
+        source: str,
+        max_depth: int = 3,
+        decay: float = 0.5,
+    ) -> Dict[str, float]:
+        """Compute Inf(source→p) for all nodes p. Returns {node_id: influence}."""
+        nodes = self.graph.all_nodes()
+        # depth-1 influence
+        inf_k = {p: self.graph.weight(p, source) for p in nodes}
+        total = dict(inf_k)
+
+        for k in range(2, max_depth + 1):
+            new_inf_k: Dict[str, float] = defaultdict(float)
+            for p in nodes:
+                for r, w_pr in self.graph.successors(p).items():
+                    new_inf_k[p] += w_pr * inf_k.get(r, 0.0)
+            lam = decay ** (k - 1)
+            for p, v in new_inf_k.items():
+                total[p] = total.get(p, 0.0) + lam * v
+            inf_k = dict(new_inf_k)
+
+        return total
+
+    def seminal_works(
+        self,
+        top_k: int = 10,
+        restrict_to_corpus: bool = False,
+        **kwargs,
+    ) -> List[Tuple[str, float]]:
+        """Rank by Σ_p Inf(q→p) — papers with broadest downstream influence."""
+        totals = self.seminal_scores(restrict_to_corpus=restrict_to_corpus, **kwargs)
+        return sorted(totals.items(), key=lambda x: x[1], reverse=True)[:top_k]
+
+    def seminal_scores(
+        self,
+        restrict_to_corpus: bool = False,
+        **kwargs,
+    ) -> Dict[str, float]:
+        """Return {node_id: Σ_p Inf(node_id→p)} for all eligible source nodes."""
+        targets = (
+            self.graph.corpus_nodes() if restrict_to_corpus
+            else self.graph.all_nodes()
+        )
+        totals: Dict[str, float] = defaultdict(float)
+        for source in targets:
+            for p, v in self.influence_from(source, **kwargs).items():
+                if p in targets:
+                    totals[source] += v
+        return dict(totals)
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Main Framework
+# ---------------------------------------------------------------------------
+
+class KnowledgeDiscoveryFramework:
+    """
+    Unified entry point for all analyses in the knowledge-discovery framework.
+
+    Sections 3–5 of the framework paper are accessible via sub-analyzers:
+      .pagerank            → PageRankAnalyzer            (§3.1)
+      .corpus_contribution → CorpusContributionAnalyzer  (§3.1 / eq. corpus_contribution)
+      .influence           → InfluenceAnalyzer            (§3.2)
+      .temporal            → TemporalAnalyzer             (§3.4)
+      .section_citations   → SectionCitationAnalyzer     (§4.1–4.2, 4.4)
+      .originality         → OriginalityAnalyzer         (§4.3)
+      .foundational        → FoundationalWorkAnalyzer    (§5.2)
+      .research_gaps       → ResearchGapDetector         (§5.3)
+    """
+
+    def __init__(self, graph: CitationGraph) -> None:
+        self.graph = graph
+        self.pagerank = PageRankAnalyzer(graph)
+        self.corpus_contribution = CorpusContributionAnalyzer(graph)
+        self.influence = InfluenceAnalyzer(graph)
+        self.temporal = TemporalAnalyzer(graph)
+        self.section_citations = SectionCitationAnalyzer(graph)
+        self.originality = OriginalityAnalyzer(graph)
+        self.foundational = FoundationalWorkAnalyzer(graph)
+        self.research_gaps = ResearchGapDetector(graph)
+
+    @classmethod
+    def from_results_dir(
+        cls,
+        results_dir: str | Path,
+        citation_mappings: Optional[Dict[str, Dict[str, str]]] = None,
+        pub_dates: Optional[Dict[str, int]] = None,
+        model_tag: str = "",
+        exclude_papers: Optional[Set[str]] = None,
+    ) -> "KnowledgeDiscoveryFramework":
+        """Build the framework from a directory of importance-scoring results."""
+        graph = CitationGraph.from_results_dir(
+            results_dir,
+            citation_mappings,
+            pub_dates,
+            model_tag=model_tag,
+            exclude_papers=exclude_papers,
+        )
+        return cls(graph)
+
+    def summary(self) -> Dict:
+        """High-level corpus and graph statistics."""
+        papers = self.graph.papers
+        orig_scores = {pid: p.originality_score() for pid, p in papers.items()}
+        avg_orig = sum(orig_scores.values()) / len(papers) if papers else 0.0
+        return {
+            "corpus_papers": len(papers),
+            "total_nodes": len(self.graph.all_nodes()),
+            "total_edges": len(self.graph.edges()),
+            "total_weight": round(self.graph.total_weight(), 6),
+            "avg_originality": round(avg_orig, 6),
+            "papers": {
+                pid: {
+                    "originality": round(orig_scores[pid], 6),
+                    "citation_importance": round(p.total_citation_importance(), 6),
+                    "unique_citations": len(p.citation_scores),
+                }
+                for pid, p in papers.items()
+            },
+        }
+
+    def __repr__(self) -> str:
+        return f"KnowledgeDiscoveryFramework(graph={self.graph!r})"
