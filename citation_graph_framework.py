@@ -756,6 +756,212 @@ class InfluenceAnalyzer:
 
 
 # ---------------------------------------------------------------------------
+# Corpus-level contribution
+# ---------------------------------------------------------------------------
+
+class CorpusContributionAnalyzer:
+    """
+    Corpus-level contribution scores and normalized influence.
+
+    Corpus-level score
+    ------------------
+        σ_P(p) = σ_tech(p) · (1 + Σ_{paths a→…→p} Π_{(u,v) on path} W(u,v))
+
+    Each paper starts with 1 unit of mass.  Mass propagates along citation
+    edges; the corpus-level score of p is its technical fraction multiplied
+    by the total mass accumulated at p.
+
+    Propagated influence mass
+    -------------------------
+    Let
+
+        M(p) = 1 + Σ_{paths a→…→p} Π_{(u,v) on path} W(u,v)
+
+    be the total multiplicative mass accumulated at p. The cross-paper
+    propagated term is then:
+
+        π_P(p) = σ_tech(p) · (M(p) − 1)
+               = σ_tech(p) · Σ_{paths a→…→p} Π_{(u,v) on path} W(u,v)
+
+    Normalized influence score
+    --------------------------
+    The fraction of all propagated cross-paper mass in the corpus attributed
+    to article p:
+
+        I_P(p) = π_P(p) / Σ_{p'∈P} π_P(p')
+
+    Computed in one topological-order pass (Kahn's algorithm).  Nodes in
+    exceptional cycles retain only the score propagated from their acyclic
+    predecessors and emit a warning.
+    """
+
+    def __init__(self, graph: CitationGraph) -> None:
+        self.graph = graph
+
+    def _compute_with_mass(self) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """Return (scores, mass) dicts keyed by paper_id."""
+        corpus = self.graph.corpus_nodes()
+
+        in_edges: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+        out_refs: Dict[str, List[str]] = defaultdict(list)
+        for (q, p), w in self.graph.edges().items():
+            if q in corpus and p in corpus:
+                in_edges[p].append((q, w))
+                out_refs[q].append(p)
+
+        in_deg: Dict[str, int] = {p: len(in_edges[p]) for p in corpus}
+        queue: deque = deque(p for p in corpus if in_deg[p] == 0)
+
+        mass: Dict[str, float] = {p: 1.0 for p in corpus}
+        scores: Dict[str, float] = {}
+
+        processed: Set[str] = set()
+        while queue:
+            q = queue.popleft()
+            processed.add(q)
+            mq = mass[q]
+            scores[q] = self.graph.papers[q].originality_score() * mq
+            for p in out_refs[q]:
+                mass[p] += self.graph.weight(q, p) * mq
+                in_deg[p] -= 1
+                if in_deg[p] == 0:
+                    queue.append(p)
+
+        unprocessed = corpus - processed
+        if unprocessed:
+            print(
+                f"[CorpusContributionAnalyzer] Warning: {len(unprocessed)} node(s) "
+                f"in a cycle; scores are partial: {sorted(unprocessed)}"
+            )
+            for p in unprocessed:
+                scores[p] = self.graph.papers[p].originality_score() * mass[p]
+
+        return scores, mass
+
+    def compute(self) -> Dict[str, float]:
+        """Return {paper_id: σ_P(p)} for every corpus paper."""
+        scores, _ = self._compute_with_mass()
+        return scores
+
+    def propagated_influence_mass(self) -> Dict[str, float]:
+        """
+        Return {paper_id: π_P(p)} where
+
+            π_P(p) = σ_tech(p) · Σ_{paths a→…→p} Π W(u,v).
+        """
+        _, mass = self._compute_with_mass()
+        return {
+            p: self.graph.papers[p].originality_score() * max(0.0, mass[p] - 1.0)
+            for p in mass
+        }
+
+    def external_contribution(self) -> Dict[str, float]:
+        """
+        Backward-compatible alias for propagated cross-paper mass.
+
+        Historically this was implemented as σ_P(p) − σ_tech(p), which is
+        algebraically equivalent to π_P(p) under the mass definition above.
+        """
+        return self.propagated_influence_mass()
+
+    def normalized_influence(self) -> Dict[str, float]:
+        """Return {paper_id: I_P(p)} — each paper's share of total cross-paper influence mass."""
+        propagated = self.propagated_influence_mass()
+        total = sum(propagated.values())
+        if total == 0:
+            return {p: 0.0 for p in propagated}
+        return {p: v / total for p, v in propagated.items()}
+
+    def top_k(self, k: int = 10) -> List[Tuple[str, float]]:
+        """Top-k by corpus-level score σ_P(p)."""
+        return sorted(self.compute().items(), key=lambda x: x[1], reverse=True)[:k]
+
+    def top_k_influence(self, k: int = 10) -> List[Tuple[str, float]]:
+        """Top-k by normalized influence score I_P(p)."""
+        return sorted(self.normalized_influence().items(), key=lambda x: x[1], reverse=True)[:k]
+
+    def _compute_source_weighted_with_mass(self) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """
+        Return (scores, propagated_mass) for the source-weighted corpus score
+
+            σ_P(p) = σ_tech(p) + Σ_{paths a→…→p} σ_tech(a) · Π W(u,v).
+
+        This satisfies the recurrence
+
+            σ_P(p) = σ_tech(p) + Σ_{q→p} W(q,p) · σ_P(q).
+        """
+        corpus = self.graph.corpus_nodes()
+
+        in_edges: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+        out_refs: Dict[str, List[str]] = defaultdict(list)
+        for (q, p), w in self.graph.edges().items():
+            if q in corpus and p in corpus:
+                in_edges[p].append((q, w))
+                out_refs[q].append(p)
+
+        in_deg: Dict[str, int] = {p: len(in_edges[p]) for p in corpus}
+        queue: deque = deque(p for p in corpus if in_deg[p] == 0)
+
+        scores: Dict[str, float] = {
+            p: self.graph.papers[p].originality_score()
+            for p in corpus
+        }
+        propagated_mass: Dict[str, float] = {p: 0.0 for p in corpus}
+
+        processed: Set[str] = set()
+        while queue:
+            q = queue.popleft()
+            processed.add(q)
+            sq = scores[q]
+            for p in out_refs[q]:
+                contribution = self.graph.weight(q, p) * sq
+                scores[p] += contribution
+                propagated_mass[p] += contribution
+                in_deg[p] -= 1
+                if in_deg[p] == 0:
+                    queue.append(p)
+
+        unprocessed = corpus - processed
+        if unprocessed:
+            print(
+                f"[CorpusContributionAnalyzer] Warning: {len(unprocessed)} node(s) "
+                f"in a cycle for source-weighted scores; values are partial: {sorted(unprocessed)}"
+            )
+
+        return scores, propagated_mass
+
+    def compute_source_weighted(self) -> Dict[str, float]:
+        """
+        Return {paper_id: σ_P(p)} for
+
+            σ_P(p) = σ_tech(p) + Σ_{paths a→…→p} σ_tech(a) · Π W(u,v).
+        """
+        scores, _ = self._compute_source_weighted_with_mass()
+        return scores
+
+    def source_weighted_propagated_mass(self) -> Dict[str, float]:
+        """
+        Return the propagated cross-paper term for the source-weighted score:
+
+            π_P^src(p) = Σ_{paths a→…→p} σ_tech(a) · Π W(u,v).
+        """
+        _, propagated_mass = self._compute_source_weighted_with_mass()
+        return propagated_mass
+
+    def normalized_source_weighted_influence(self) -> Dict[str, float]:
+        """
+        Return normalized source-weighted propagated influence
+
+            I_P^src(p) = π_P^src(p) / Σ_{p'∈P} π_P^src(p').
+        """
+        propagated = self.source_weighted_propagated_mass()
+        total = sum(propagated.values())
+        if total == 0:
+            return {p: 0.0 for p in propagated}
+        return {p: v / total for p, v in propagated.items()}
+
+
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Main Framework
 # ---------------------------------------------------------------------------
